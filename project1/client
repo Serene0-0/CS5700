@@ -1,0 +1,177 @@
+#! /usr/bin/env python3
+"""
+    Project1_Socket Client
+    25Spring CS5700
+    Shiyu Chen
+"""
+import argparse
+import json
+import ssl
+from random import choice
+from socket import *
+
+
+def create_socket(host, port, tls=False):
+    """
+    create a TCP socket or TLS socket
+    :param host: host address
+    :param port: port number
+    :param tls: whether to use TLS or not
+    :return: client socket
+    """
+    data_socket = socket(AF_INET, SOCK_STREAM)
+    data_socket.connect((host, port))
+
+    if tls:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        data_socket = context.wrap_socket(data_socket, server_hostname=host)
+    return data_socket
+
+
+def receive_message(data_socket):
+    """
+    receive message from data socket
+    :param data_socket: socket object
+    :return: decoded data message
+    """
+    BUFFER_SIZE = 1024
+    data = b""
+    while not data.endswith(b"\n"):
+        data += data_socket.recv(BUFFER_SIZE)
+    return data.decode("utf-8").strip()
+
+
+def send_message(data_socket, message):
+    """
+    send message to server
+    :param data_socket: socket object
+    :param message: message to send
+    """
+    json_msg = json.dumps(message) + '\n'
+    data_socket.sendall(json_msg.encode("utf-8"))
+
+
+def parse_message(message):
+    """
+    parse message in json format
+    :param message: message to parse
+    :return: parsed message
+    """
+    return json.loads(message)
+
+
+def match_word(check_word, guess_word, mark):
+    """
+    check if the guessing word matches mark
+    :param check_word: the word need to be matched
+    :param guess_word: the word guess this time
+    :param mark: the mark the server replies
+    :return: boolean, true if the word matches mark, else false
+    """
+    for i in range(5):
+        if mark[i] == 2:
+            if check_word[i] != guess_word[i]:
+                return False
+        elif mark[i] == 1:
+            if check_word[i] == guess_word[i]:
+                return False
+            if guess_word[i] not in check_word:
+                return False
+        elif mark[i] == 0:
+            if check_word[i] == guess_word[i]:
+                return False
+    return True
+
+
+def filtered_wordlist(wordlist, guesses):
+    """
+    filter wordlist
+    :param wordlist: wordlist includes all the words
+    :param guesses: the guesses history from server
+    :return:
+    """
+    filtered = []
+    for word in wordlist:
+        valid_word = True
+        for guess in guesses:
+            guess_word = guess["word"]
+            mark = guess["marks"]
+            if not match_word(word, guess_word, mark):
+                valid_word = False
+                break
+        if valid_word:
+            filtered.append(word)
+    return filtered
+
+def run_game_wordle(data_socket, username):
+    """
+    run game wordle
+    :param data_socket: socket object
+    :param username: neu username
+    :return: secret flag
+    """
+    # send hello message to the server
+    hello_msg = {"type": "hello", "northeastern_username":username}
+    send_message(data_socket, hello_msg)
+    # receive start message from the server
+    start_msg = receive_message(data_socket)
+    start_data = parse_message(start_msg)
+    if start_data["type"] == "start":
+        game_id = start_data["id"]
+    else:
+        return
+    # load wordlist
+    with open('wordlist.txt', 'r') as f:
+        wordlist = [word.strip() for word in f.readlines()]
+    #guess words
+    for i in range(500):
+        guess_word = choice(wordlist)
+        guess_msg = {"type": "guess", "id": game_id, "word": guess_word}
+        send_message(data_socket, guess_msg)
+        guess_response = receive_message(data_socket)
+        guess_data = parse_message(guess_response)
+        response_type = guess_data.get("type")
+        if response_type == "retry":
+            guess_history = guess_data.get("guesses", [])
+            wordlist = filtered_wordlist(wordlist, guess_history)
+        elif response_type == "bye":
+            flag = guess_data.get("flag", "")
+            print(flag)
+            return
+        elif response_type == "error":
+            error_msg = guess_data.get("message", "")
+            print(error_msg)
+            return
+
+
+def parse_command():
+    """
+    parse command line
+    example command: $ ./client <-p port> <-s> <hostname> <Northeastern-username>
+    :return:
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--port", help="port number", type=int)
+    parser.add_argument("-s", "--secure", help="TLS encrypted connection", action='store_true')
+    parser.add_argument("hostname", help="server hostname", type=str)
+    parser.add_argument("Northeastern_username", help="neu username")
+    args = parser.parse_args()
+    if args.port is None:
+        if args.secure:
+            args.port = 27994
+        else:
+            args.port = 27993
+    return args
+
+def main():
+    args = parse_command()
+    data_socket = create_socket(args.hostname, args.port, args.secure)
+    try:
+        run_game_wordle(data_socket, args.Northeastern_username)
+    finally:
+        data_socket.close()
+
+if __name__ == '__main__':
+    main()

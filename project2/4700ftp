@@ -1,0 +1,297 @@
+#! /usr/bin/env python3
+"""
+    FTP Client
+    25 Spring
+    Shiyu Chen
+"""
+import argparse
+import os
+import sys
+from socket import *
+from urllib.parse import urlparse
+
+
+def parse_url(ftp_url):
+    """
+    Parse the ftp url into its components.
+    :param ftp_url: URL in format ftp://[USER[:PASSWORD]@]HOST[:PORT]/PATH
+    :return: Dictionary of URL components
+    """
+    parsed = urlparse(ftp_url)
+    if parsed.scheme != 'ftp':
+        raise ValueError('FTP URL must start with ftp://')
+
+    host = parsed.hostname
+    port = 21
+    username = "anonymous"
+    password = ""
+    path = parsed.path
+    if not host:
+        raise ValueError(f"FTP URL missing host: {ftp_url}")
+    if not path:
+        raise ValueError(f"FTP URL missing path: {ftp_url}")
+    if parsed.port:
+        port = parsed.port
+    if parsed.username:
+        username = parsed.username
+    if parsed.password:
+        password = parsed.password
+    return {'host': host, 'port': port,
+            'username': username, 'password': password,
+            'path': path}
+
+
+def parse_command_line():
+    """
+    Parse command line arguments and check the validity of them.
+    cp command example:
+    $ ./4700ftp cp other-hw/essay.pdf ftp://bob:s3cr3t@ftp.example.com/documents/homeworks-v2/essay.pdf
+    :return: arguments
+    """
+    parser = argparse.ArgumentParser(description='FTP Client')
+    parser.add_argument('operation',
+                        choices=["ls", "mkdir", "rm", "rmdir", "cp", "mv"],
+                        help='FTP command to execute')
+    parser.add_argument('param1', help='ftp_rul or path (required)')
+    parser.add_argument('param2', nargs="?", help='path (for command: cp or mv)')
+    args = parser.parse_args()
+
+    if args.param1 is None:
+        print("Please specify a path")
+        sys.exit(1)
+
+    if args.operation in ["cp", "mv"] and args.param2 is None:
+        print("cp and mv commands require two parameters")
+        sys.exit(1)
+
+    if args.operation not in ["cp", "mv"] and args.param2:
+        print(f"Please specify only one path. The '{args.operation}' command does not accept a second argument.")
+        sys.exit(1)
+
+    param1_info = args.param1
+    if param1_info.startswith("ftp://"):
+        param1_info = parse_url(param1_info)
+    param2_info = args.param2
+    if param2_info and param2_info.startswith("ftp://"):
+        param2_info = parse_url(param2_info)
+
+    return args, param1_info, param2_info
+
+def send_request(sock, command):
+    """
+    Send request to FTP server and get the response.
+    :param sock: control channel socket
+    :param command: command to send
+    :return:
+    """
+    sock.sendall(f"{command}\r\n".encode())
+    response = sock.recv(1024).decode()
+    print(response)
+    return response
+
+
+def connect_ftp(username, password, host, port=21, ):
+    """
+    Connect to FTP server and create control channel
+    :param password: FTP password
+    :param username: FTP username
+    :param host: server host
+    :param port: server port
+    :return: socket object
+    """
+    sock = socket(AF_INET, SOCK_STREAM)
+    sock.connect((host, port))
+
+    send_request(sock, f"USER {username}")
+    send_request(sock, f"PASS {password}")
+    send_request(sock, "TYPE I")
+    send_request(sock, "MODE S")
+    send_request(sock, "STRU F")
+
+    return sock
+
+
+def quit_ftp(sock):
+    """
+    Quit FTP server
+    :param sock: control channel socket
+    """
+    send_request(sock, "QUIT")
+    sock.close()
+
+
+def enter_pasv(sock):
+    """
+    Open data channel and parse IP address and port
+    :param sock: control channel socket
+    :return: data channel socket object
+    """
+    BYTE_SHIFT = 8
+
+    response = send_request(sock, "PASV")
+
+    while not response.startswith("227"):
+        if not response:
+            raise Exception("No response received for PASV command.")
+        elif response.startswith(("4", "5", "6")):
+            raise ConnectionError(f"Failed to connect to data channel: {response}")
+        print(response.strip())
+        response = sock.recv(1024).decode()
+
+    # find the start and end of ip addresses and port no.
+    start = response.find('(')
+    end = response.find(')')
+    if start == -1 or end == -1:
+        raise Exception(f"Invalid PASV response: {response}")
+
+    parts = response[start + 1:end].split(',')
+    if len(parts) != 6:
+        raise Exception(f"Invalid PASV response: {response}")
+
+    ip = ".".join(parts[:4])
+    port = (int(parts[4]) << BYTE_SHIFT) + int(parts[5])
+
+    # connect to the data channel
+    data_socket = socket(AF_INET, SOCK_STREAM)
+    data_socket.connect((ip, port))
+
+    return data_socket
+
+def list_files(sock, path):
+    """
+    Handle the command LIST to list contents in a specific directory
+    :param path: path to directory
+    :param sock: control channel socket
+    """
+    data_socket = enter_pasv(sock)
+    send_request(sock, f"LIST {path}")
+
+    # read data from data channel
+    data = []
+    while True:
+        chunk = data_socket.recv(4096)
+        if not chunk:
+            break
+        data.append(chunk.decode())
+    contents = "".join(data).strip()
+    print("CONTENTS:")
+    for line in contents.split("\n"):
+        print(f"  {line.strip()}")
+
+    data_socket.close()
+
+
+def delete_file(sock, path):
+    """
+    Handle the command DELE to delete a specific file
+    :param sock: control channel socket
+    :param path: path to file
+    """
+    send_request(sock, f"DELE {path}")
+
+
+def make_directory(sock, path):
+    """
+    Handle the command MKD to make a specific directory
+    :param sock: control channel socket
+    :param path: path to directory
+    """
+    send_request(sock, f"MKD {path}")
+
+
+def delete_directory(sock, path):
+    """
+    Handle the command RMD to delete a specific directory
+    :param sock: control channel socket
+    :param path: path to directory
+    """
+    send_request(sock, f"RMD {path}")
+
+
+def upload_file(sock, local_path, remote_path):
+    """
+    Handle the command STOR to upload a specific file with the given path to FTP server
+    :param sock: control channel socket
+    :param local_path: path of local file
+    :param remote_path: path of server
+    """
+    data_socket = enter_pasv(sock)
+    response = send_request(sock, f"STOR {remote_path}")
+    if not response.startswith("1"):
+        raise Exception(f"STOR Failed: {response}")
+
+    with open(local_path, "rb") as local_file:
+        while True:
+            chunk = local_file.read(4096)
+            if not chunk:
+                break
+            data_socket.send(chunk)
+    data_socket.close()
+
+    response = sock.recv(1024).decode()
+    if not response.startswith("2"):
+        raise Exception(f"File upload failed: {response}")
+
+
+def download_file(sock, local_path, remote_path):
+    """
+    Handle the command RETR to download a specific file with the given path from FTP server
+    :param sock: control channel socket
+    :param local_path: path to save file locally
+    :param remote_path: path of server
+    """
+    data_socket = enter_pasv(sock)
+    response = send_request(sock, f"RETR {remote_path}")
+    if not response.startswith("1"):
+        raise Exception(f"RETR Failed: {response}")
+
+    with open(local_path, "wb") as local_file:
+        while True:
+            chunk = data_socket.recv(4096)
+            if not chunk:
+                break
+            local_file.write(chunk)
+    data_socket.close()
+
+    response = sock.recv(1024).decode()
+    if not response.startswith("2"):
+        raise Exception(f"File download failed: {response}")
+
+
+def main():
+    args, param1_info, param2_info = parse_command_line()
+    if "host" in param1_info:
+        ftp_info = param1_info
+    else:
+        ftp_info = param2_info
+
+    control_channel = connect_ftp(ftp_info["username"], ftp_info["password"],
+                                  ftp_info["host"], ftp_info["port"])
+    try:
+        if args.operation == "ls":
+            list_files(control_channel, ftp_info["path"])
+        elif args.operation == "mkdir":
+            make_directory(control_channel, ftp_info["path"])
+        elif args.operation == "rm":
+            delete_file(control_channel, ftp_info["path"])
+        elif args.operation == "rmdir":
+            delete_directory(control_channel, ftp_info["path"])
+        elif args.operation == "cp":
+            if "host" in param1_info:
+                download_file(control_channel, param2_info, ftp_info["path"])
+            elif "host" in param2_info:
+                upload_file(control_channel, param1_info, ftp_info["path"])
+        elif args.operation == "mv":
+            if "host" in param1_info:
+                download_file(control_channel, param2_info, ftp_info["path"])
+                delete_file(control_channel, ftp_info["path"])
+            elif "host" in param2_info:
+                upload_file(control_channel, param1_info, ftp_info["path"])
+                os.remove(param1_info)
+        else:
+            raise Exception(f"Unknown operation: {args.operation}")
+    finally:
+        quit_ftp(control_channel)
+
+if __name__ == "__main__":
+    main()

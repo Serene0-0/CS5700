@@ -1,0 +1,602 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+
+
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+    forwarding_table = {}
+    revocation_record = []
+    message_history = {}
+
+    def __init__(self, asn, connections):
+        """
+        Initialize the router
+        :param asn: Autonomous System number
+        :param connections: the connections args in command line
+        """
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+
+
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+
+    def listen(self):
+        """
+        Listen on all sockets
+        :return:
+        """
+        inputs = self.sockets
+        while True:
+            readable, writable, exceptional = select.select(inputs, [], [])
+
+            for sock in readable:
+                data = sock.recv(4096).decode()
+                msg = json.loads(data)
+                print(json.dumps(msg) + '\n')
+
+                sender = None
+                for neighbor, s in self.sockets.items():
+                    if s == sock:
+                        sender = neighbor
+                        break
+
+                if sender:
+                    self.handle_msg_type(msg, sender)
+
+
+    def handle_update(self, msg, sender):
+        """
+        handle "update" messages, update the forwarding table and forward updates
+        :param sender: the sender address
+        :param msg: update message
+        """""
+        # store the update msg
+        if sender not in self.message_history:
+            self.message_history[sender] = []
+        self.message_history[sender].append(msg)
+
+        self.add_route_forwarding_table(msg, sender)
+        # print(f"[handle_update] Received route to {network}/{netmask} from {sender} (relation: {sender_relation})")
+
+        # trigger to aggregate forwarding table
+        self.aggregate_network()
+
+        new_aspath = [self.asn] + msg["msg"]["ASPath"]
+        sender_relation = self.relations.get(sender, None)
+
+        for neighbor, relation in self.relations.items():
+            if neighbor == sender:
+                continue
+
+            if self.can_forward(sender_relation, relation):
+                update_msg = {
+                    "src": self.our_addr(neighbor),
+                    "dst": neighbor,
+                    "type": "update",
+                    "msg": {
+                        "network": msg["msg"]["network"],
+                        "netmask": msg["msg"]["netmask"],
+                        "ASPath": new_aspath
+                    }
+                }
+                self.send(neighbor, json.dumps(update_msg))
+
+
+
+    def handle_data(self, msg, sender):
+        """
+        forward data to appropriate neighbors
+        :param sender:
+        :param msg: data message
+        :return:
+        """
+        destination = msg["dst"]
+        src_relation = self.relations.get(sender, None)
+
+        print(f"[handle_data] Received data from {sender} (relationship={src_relation}), "
+              f"dst={destination}, full_msg={msg}")
+
+        best_route = None
+        longest_prefix_len = -1
+
+        for network, routes in self.forwarding_table.items():
+            for route in routes:
+                if self.in_subnet(destination, network, route["netmask"]):
+                    prefix_len = self.netmask_to_bin(route["netmask"]).count("1")
+                    if prefix_len > longest_prefix_len:
+                        best_route = route
+                        longest_prefix_len = prefix_len
+                    elif prefix_len == longest_prefix_len:
+                        if self.compare_route(route, best_route):
+                            best_route = route
+
+        if best_route:
+            next_hop = best_route["next_hop"]
+            neighbor_relation = self.relations.get(next_hop, None)
+            if self.can_forward(src_relation, neighbor_relation):
+                self.send(next_hop, json.dumps(msg))
+        else:
+            no_route_msg = {
+                "src": destination,
+                "dst": msg["src"],
+                "type": "no route",
+                "msg": {}
+            }
+            self.send(msg["src"], json.dumps(no_route_msg))
+
+
+    def handle_dump(self, msg):
+        """
+        handle "dump" messages and respond "table" messages
+        :param msg: dump message
+        :return:
+        """
+        table_msg = {
+            "src": msg["dst"],
+            "dst": msg["src"],
+            "type": "table",
+            "msg": []
+        }
+
+        for network, routes in self.forwarding_table.items():
+            for route in routes:
+                table_msg["msg"].append({
+                    "network": network,
+                    "netmask": route["netmask"],
+                    "peer": route["next_hop"],
+                    "localpref": route["localpref"],
+                    "ASPath": route["ASPath"],
+                    "selfOrigin": route["selfOrigin"],
+                    "origin": route["origin"]
+                })
+
+        self.send(msg["src"], json.dumps(table_msg))
+
+
+    def handle_withdraw(self, msg, sender):
+        """
+        handle "withdraw" messages and "no route data"
+        :param sender:
+        :param msg:
+        :return:
+        """
+        # store the withdrawal msg
+        if sender not in self.message_history:
+            self.message_history[sender] = []
+        self.message_history[sender].append(msg)
+
+        self.rebuild_forwarding_table()
+
+        sender_relation = self.relations.get(sender, None)
+
+        for neighbor, relation in self.relations.items():
+            if neighbor == sender:
+                continue
+
+            if self.can_forward(sender_relation, relation):
+                send_msg = {
+                    "src": self.our_addr(neighbor),
+                    "dst": neighbor,
+                    "type": "withdraw",
+                    "msg": msg["msg"]
+                }
+                self.send(neighbor, json.dumps(send_msg))
+
+
+    def handle_msg_type(self, msg, sender):
+        """
+        handle different types of messages
+        :param sender: msg sender
+        :param msg: bgp message
+        """
+        msg_type = msg["type"]
+        if msg_type == "update":
+            self.handle_update(msg, sender)
+        elif msg_type == "dump":
+            self.handle_dump(msg)
+        elif msg_type == "data":
+            self.handle_data(msg, sender)
+        elif msg_type == "withdraw":
+            self.handle_withdraw(msg, sender)
+
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+                msg = json.loads(msg)
+                self.handle_msg_type(msg, srcif)
+
+                print("Received message '%s' from %s" % (msg, srcif))
+        return
+
+
+    # helper function
+    def can_forward(self, sender_relation, neighbor_relation):
+        """
+        check if the msg can be forwarded to neighbor
+        :param sender_relation: the relation of the sender
+        :param neighbor_relation: the relation of the destination
+        :return: boolean true if the msg can be forwarded to neighbor, else false
+        """
+        if sender_relation == "cust":
+            return True
+        elif neighbor_relation == "cust":
+            return True
+        return False
+
+
+    def compare_route(self, new_route, current_route):
+        """
+        compare two routes based on five rules
+        :param new_route: the new route
+        :param current_route: the current route
+        """
+        # (1) compare local pref, the higher, the better
+        if new_route["localpref"] > current_route["localpref"]:
+            return True
+        elif new_route["localpref"] < current_route["localpref"]:
+            return False
+        # (2) compare self origin, true is better
+        if new_route["selfOrigin"] and not current_route["selfOrigin"]:
+            return True
+        elif current_route["selfOrigin"] and not new_route["selfOrigin"]:
+            return False
+        # (3) compare ASPath length
+        if len(new_route["ASPath"]) < len(current_route["ASPath"]):
+            return True
+        elif len(new_route["ASPath"]) > len(current_route["ASPath"]):
+            return False
+        # (4) compare origin
+        new_origin_rank = self.origin_rank(new_route["origin"])
+        current_origin_rank = self.origin_rank(current_route["origin"])
+        if new_origin_rank > current_origin_rank:
+            return True
+        elif new_origin_rank < current_origin_rank:
+            return False
+        # (5) compare next hope
+        if new_route["next_hop"] < current_route["next_hop"]:
+            return True
+        else:
+            return False
+
+
+    def origin_rank(self, origin):
+        """
+        helper function to get rank of origin
+        :param origin: route origin
+        :return: the rank of origin
+        """
+        if origin == "IGP":
+            return 2
+        elif origin == "EGP":
+            return 1
+        else:
+            return 0
+
+
+    def in_subnet(self, network, subnet, netmask):
+        """
+        check if the network is in the subnet
+        :param network: the network
+        :param subnet: subnet
+        :param netmask: netmask of the subnet
+        :return: boolean indicating if the network is in the subnet
+        """
+        network_prefix = self.get_prefix(subnet, netmask)
+        subnet_prefix = self.get_prefix(network, netmask)
+        if network_prefix == subnet_prefix:
+            return True
+        return False
+
+
+    def convert_ip_to_bin(self, ip):
+        """
+        convert ip to binary representation
+        :param ip: ip address in decimal format
+        :return: binary representation of ip
+        """
+        ip_list = ip.split('.')
+        temp_ip = []
+        for part in ip_list:
+            if part.isdigit():
+                part = bin(int(part))[2:]  # convert to binary and remove the first 2 char: 0b
+                temp_ip.append(part.zfill(8)) # convert each part to 8 bits and prepend 0
+
+        return ''.join(temp_ip)
+
+
+    def convert_ip_bin_to_dec(self, ip_bin):
+        """
+        convert ip binary to decimal representation
+        :param ip_bin: ip binary representation
+        :return: decimal representation of ip
+        """
+        ip_string = str(int(ip_bin[0 : 8], 2))
+        for i in range(1, 4):
+            ip_string = ip_string + '.' + str(int(ip_bin[i*8 : (i+1)*8], 2))
+        return ip_string
+
+
+    def netmask_to_bin(self, netmask):
+        """
+        convert netmask to binary representation
+        :param netmask: netmask in decimal format
+        :return: netmask in binary format
+        """
+        return self.convert_ip_to_bin(netmask)
+
+
+    def get_prefix(self, ip, netmask):
+        """
+        get prefix from ip and netmask
+        :param ip: ip address in decimal format
+        :param netmask: netmask in decimal format
+        :return: prefix in binary format
+        """
+        ip_bin = self.convert_ip_to_bin(ip)
+        netmask_bin = self.convert_ip_to_bin(netmask)
+        prefix_len = netmask_bin.count('1')
+        return ip_bin[:prefix_len]
+
+
+    def add_route_forwarding_table(self, msg, sender):
+        """
+        add new route to forwarding table
+        :param msg: update message
+        :param sender:
+        """
+        if self.asn in msg["msg"]["ASPath"]:
+            return
+
+        network = msg["msg"]["network"]
+        netmask = msg["msg"]["netmask"]
+        localpref = msg["msg"]["localpref"]
+        self_origin = msg["msg"]["selfOrigin"]
+        as_path = msg["msg"]["ASPath"]
+        origin = msg["msg"]["origin"]
+
+        newer_route = {
+            "netmask": netmask,
+            "localpref": localpref,
+            "selfOrigin": self_origin,
+            "ASPath": as_path,
+            "origin": origin,
+            "next_hop": sender,
+        }
+
+        if network not in self.forwarding_table:
+            self.forwarding_table[network] = []
+
+        curr_route = self.forwarding_table[network]
+        route_exist = False
+        for route in curr_route:
+            if (route["localpref"] == localpref and route["selfOrigin"] == self_origin and route["ASPath"] == as_path
+                and route["origin"] == origin and route["next_hop"] == sender):
+                route_exist = True
+                break
+        if not route_exist:
+            curr_route.append(newer_route)
+
+
+    def remove_route_forwarding_table(self, msg, sender):
+        """
+        remove route from forwarding table
+        :param msg: withdraw message
+        :param sender:
+        """
+        for detail in msg["msg"]:
+            network = detail["network"]
+            netmask = detail["netmask"]
+
+            key = (network, netmask)
+            self.revocation_record.append(key)
+
+            if network in self.forwarding_table:
+                stored_routes = self.forwarding_table[network]
+                temp = []
+                for route in stored_routes:
+                    if not (route["netmask"] == netmask and route["next_hop"] == sender):
+                        temp.append(route)
+
+                self.forwarding_table[network] = temp
+                # if the network is empty, remove the entry
+                if network in self.forwarding_table and not self.forwarding_table[network]:
+                    del self.forwarding_table[network]
+
+
+
+    def adjacent_network(self, network1, network2, netmask):
+        """
+        check if the two networks are adjacent
+        :param network1: the network 1 need to be checked
+        :param network2: the network 2 need to be checked
+        :param netmask: the netmask of two networks
+        :return: boolean true if the two networks are adjacent, else false
+        """
+        network1_bin = self.convert_ip_to_bin(network1)
+        network2_bin = self.convert_ip_to_bin(network2)
+
+        netmask_bin = self.netmask_to_bin(netmask)
+        prefix_len = netmask_bin.count('1')
+        host_bits = 32 - prefix_len
+
+        if (network1_bin[prefix_len:] != '0' * host_bits) or (network2_bin[prefix_len:] != '0' * host_bits):
+            return False
+
+        network1_prefix = network1_bin[:prefix_len]
+        network2_prefix = network2_bin[:prefix_len]
+
+        diff = int(network1_prefix, 2) - int(network2_prefix, 2)
+
+        if abs(diff) == 1:
+            return True
+        else:
+            return False
+
+
+    def shorten_netmask(self, netmask):
+        """
+        shorten netmask
+        :param netmask: netmask in decimal format
+        :return: shorten netmask in binary format
+        """
+        netmask_bin = self.netmask_to_bin(netmask)
+        prefix_len = netmask_bin.count('1') - 1
+        new_netmask = '1' * prefix_len + '0' * (32 - prefix_len)
+        return self.convert_ip_bin_to_dec(new_netmask)
+
+
+    def can_merge(self, route1, route2):
+        """
+        check if the two routes can be merged
+        """
+        if route1["netmask"] != route2["netmask"]:
+            return False
+        if (route1["localpref"] != route2["localpref"]
+            or route1["ASPath"] != route2["ASPath"]
+            or route1["origin"] != route2["origin"]
+            or route1["next_hop"] != route2["next_hop"]):
+            return False
+        return self.adjacent_network(route1["network"], route2["network"], route1["netmask"])
+
+    def merge_two_routes(self, route1, route2):
+        """
+        merge two adjacent routes
+        :return: new route
+        """
+        netmask = route1["netmask"]
+        new_netmask = self.shorten_netmask(netmask)
+
+        network1_bin = self.convert_ip_to_bin(route1["network"])
+        prefix_len = self.netmask_to_bin(netmask).count('1')
+        new_prefix_len = prefix_len - 1
+        new_network_bin = network1_bin[:new_prefix_len] + '0' * (32 - new_prefix_len)
+        new_network = self.convert_ip_bin_to_dec(new_network_bin)
+
+        new_route = {
+            "network": new_network,
+            "netmask": new_netmask,
+            "localpref": route1["localpref"],
+            "ASPath": route1["ASPath"],
+            "selfOrigin": route1["selfOrigin"],
+            "origin": route1["origin"],
+            "next_hop": route1["next_hop"],
+        }
+        return new_route
+
+
+    def iterative_merge_network(self, networks):
+        merge = True
+
+        while merge:
+            merge = False
+            new_routes = []
+            merged_mark = [False] * len(networks)
+
+            for i in range(len(networks)):
+                if merged_mark[i]:
+                    continue
+                merged_route = networks[i]
+                for j in range(i+1, len(networks)):
+                    if merged_mark[j]:
+                        continue
+
+                    if self.can_merge(merged_route, networks[j]):
+                        merged_route = self.merge_two_routes(merged_route, networks[j])
+                        merged_mark[j] = True
+                        merge = True
+
+                new_routes.append(merged_route)
+            networks = new_routes
+        return networks
+
+
+    def aggregate_network(self):
+        """
+        aggregate routes in forwarding table by attribute group and netmask
+        """
+        all_routes = []
+        for network, routes in self.forwarding_table.items():
+            for route in routes:
+                copy = route.copy()
+                copy["network"] = network
+                all_routes.append(copy)
+
+        groups = {}
+        for route in all_routes:
+            key = (route["localpref"], tuple(route["ASPath"]), route["origin"], route["next_hop"])
+            groups.setdefault(key, []).append(route)
+
+        aggregated_routes = []
+        for key, group in groups.items():
+            group_sorted = sorted(group, key=lambda r: (self.convert_ip_to_bin(r["network"]), -self.netmask_to_bin(r["netmask"]).count("1")))
+
+            merged_group = self.iterative_merge_network(group_sorted)
+            aggregated_routes.extend(merged_group)
+
+
+        aggregated_forwarding_table = {}
+        for route in aggregated_routes:
+            key = route["network"]
+            aggregated_forwarding_table.setdefault(key, []).append({
+                "netmask": route["netmask"],
+                "localpref": route["localpref"],
+                "ASPath": route["ASPath"],
+                "selfOrigin": route["selfOrigin"],
+                "origin": route["origin"],
+                "next_hop": route["next_hop"],
+            })
+        self.forwarding_table = aggregated_forwarding_table
+
+
+    def rebuild_forwarding_table(self):
+        """
+        clear the forwarding table and rebuild by message history
+        """
+        self.forwarding_table.clear()
+
+        for sender, messages in self.message_history.items():
+            for msg in messages:
+                if msg["type"] == "update":
+                    self.add_route_forwarding_table(msg, sender)
+                elif msg["type"] == "withdraw":
+                    self.remove_route_forwarding_table(msg, sender)
+
+        self.aggregate_network()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
