@@ -31,17 +31,17 @@ My approach can be divided into following four parts:
    ./4700ftp --help
 2. test basic command
    1) ls
-   ./4700ftp ls ftp://chen.shiyu1:SERCRET_FLAG@ftp.4700.network/
+   ./4700ftp ls ftp://username:SERCRET_FLAG@ftp.4700.network/
    2) mkdir
-   ./4700ftp mkdir ftp://chen.shiyu1:SERCRET_FLAG@ftp.4700.network/test_new_folder
+   ./4700ftp mkdir ftp://username:SERCRET_FLAG@ftp.4700.network/test_new_folder
    3) cp
-   ./4700ftp cp /project2/test_upload.txt ftp://chen.shiyu1:SERCRET_FLAG@ftp.4700.network/uploaded_test.txt
+   ./4700ftp cp /project2/test_upload.txt ftp://username:SERCRET_FLAG@ftp.4700.network/uploaded_test.txt
    4) rm
-   ./4700ftp rm ftp://chen.shiyu1:SERCRET_FLAG@ftp.4700.network/uploaded_test.txt
+   ./4700ftp rm ftp://username:SERCRET_FLAG@ftp.4700.network/uploaded_test.txt
     and using ls to check if the file is deleted
    5) rmdir
-   ./4700ftp rmdir ftp://chen.shiyu1:SERCRET_FLAG@ftp.4700.network/my_new_folder
+   ./4700ftp rmdir ftp://username:SERCRET_FLAG@ftp.4700.network/my_new_folder
    and using ls to check if the directory is deleted
    6) mv
-   ./4700ftp mv ftp://chen.shiyu1:SERCRET_FLAG@ftp.4700.network/uploaded_test.txt project2/test.txt
+   ./4700ftp mv ftp://username:SERCRET_FLAG@ftp.4700.network/uploaded_test.txt project2/test.txt
    and using ls to check if the file is deleted, also check the local file is written successfully
