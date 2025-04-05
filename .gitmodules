@@ -4,3 +4,6 @@
 [submodule "project5"]
 	path = project5
 	url = https://github.com/Serene0-0/CS5700-project5.git
+[submodule "project6"]
+	path = project6
+	url = https://github.com/Serene0-0/5700-project6.git
